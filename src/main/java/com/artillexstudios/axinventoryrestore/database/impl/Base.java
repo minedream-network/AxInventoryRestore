@@ -40,6 +40,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
 
 import static com.artillexstudios.axinventoryrestore.AxInventoryRestore.CONFIG;
 import static com.artillexstudios.axinventoryrestore.AxInventoryRestore.DISCORD;
@@ -51,6 +52,7 @@ public abstract class Base implements Database {
     private final HashBiMap<Integer, String> reasonCache = HashBiMap.create();
     private final HashBiMap<Integer, String> worldCache = HashBiMap.create();
     private final AtomicBoolean cleaning = new AtomicBoolean(false);
+    private final ReentrantLock mutationLock = new ReentrantLock();
     private long nextClear = 0;
 
     public abstract Connection getConnection();
@@ -281,68 +283,115 @@ public abstract class Base implements Database {
         final Location location = player.getLocation();
 
         AxInventoryRestore.getThreadedQueue().submit(() -> {
-            if (AxInventoryRestore.isDebugMode()) LogUtils.debug("ThreadedQueue submit for {} in {}ms", player.getName(), System.currentTimeMillis() - time);
-            byte[] inventory = Serializers.ITEM_ARRAY.serialize(items);
+            this.mutationLock.lock();
+            try {
+                if (AxInventoryRestore.isDebugMode()) LogUtils.debug("ThreadedQueue submit for {} in {}ms", player.getName(), System.currentTimeMillis() - time);
+                byte[] inventory = Serializers.ITEM_ARRAY.serialize(items);
 
-            final Integer userId = getUserId(player.getUniqueId());
-            if (userId == null) {
-                return;
-            }
+                final Integer userId = getUserId(player.getUniqueId());
+                final Integer reasonId = getReasonId(reason);
+                if (userId == null || reasonId == null) {
+                    return;
+                }
 
-            // It is most likely that the inventory is the same for the same user in the last backup
-            // Sadly this costs more storage space, but it should be a lot faster
-            Integer storedId = null;
-            Integer backupId = getLastBackupInventoryId(userId);
-            if (backupId != null) {
-                byte[] bytes = getBytesFromBackup(backupId);
-                if (bytes != null) {
-                    if (Arrays.equals(inventory, bytes)) {
-                        storedId = backupId;
+                final int worldId = storeWorld(location.getWorld().getName());
+                Integer storedId = null;
+                Integer lastInventoryId = getLastBackupInventoryId(userId);
+                if (lastInventoryId != null) {
+                    byte[] lastInventory = getBytesFromBackup(lastInventoryId);
+                    if (lastInventory != null && Arrays.equals(inventory, lastInventory)) {
+                        storedId = lastInventoryId;
                     }
                 }
-            }
 
-            if (storedId == null) {
-                storedId = storeItems(inventory);
-            }
+                Connection connection = null;
+                boolean originalAutoCommit = true;
+                boolean saved = false;
+                try {
+                    connection = getConnection();
+                    if (connection == null) {
+                        throw new SQLException("No database connection was available");
+                    }
 
-            try (Connection conn = getConnection(); PreparedStatement stmt = conn.prepareStatement(sql)) {
-                stmt.setInt(1, userId);
-                stmt.setInt(2, getReasonId(reason));
-                stmt.setInt(3, storeWorld(location.getWorld().getName()));
-                stmt.setInt(4, location.getBlockX());
-                stmt.setInt(5, location.getBlockY());
-                stmt.setInt(6, location.getBlockZ());
-                stmt.setInt(7, storedId);
-                stmt.setLong(8, System.currentTimeMillis());
-                stmt.setString(9, cause);
-                stmt.executeUpdate();
-            } catch (Exception exception) {
-                log.error("An unexpected error occurred while saving inventory of user {}!", player.getName(), exception);
-            }
-            if (AxInventoryRestore.isDebugMode()) LogUtils.debug("Backup ready for {} in {}ms", player.getName(), System.currentTimeMillis() - time);
+                    originalAutoCommit = connection.getAutoCommit();
+                    connection.setAutoCommit(false);
+                    if (storedId == null) {
+                        storedId = storeItems(connection, inventory);
+                    }
 
-            BackupLimiter.tryLimit(player.getUniqueId(), reason.toLowerCase(Locale.ENGLISH).replace("_", "-"), reason);
+                    try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+                        stmt.setInt(1, userId);
+                        stmt.setInt(2, reasonId);
+                        stmt.setInt(3, worldId);
+                        stmt.setInt(4, location.getBlockX());
+                        stmt.setInt(5, location.getBlockY());
+                        stmt.setInt(6, location.getBlockZ());
+                        stmt.setInt(7, storedId);
+                        stmt.setLong(8, System.currentTimeMillis());
+                        stmt.setString(9, cause);
+                        stmt.executeUpdate();
+                    }
+                    connection.commit();
+                    saved = true;
+                } catch (Exception exception) {
+                    if (connection != null) {
+                        try {
+                            connection.rollback();
+                        } catch (SQLException rollbackException) {
+                            exception.addSuppressed(rollbackException);
+                        }
+                    }
+                    log.error("An unexpected error occurred while saving inventory of user {}!", player.getName(), exception);
+                } finally {
+                    if (connection != null) {
+                        try {
+                            connection.setAutoCommit(originalAutoCommit);
+                        } catch (SQLException exception) {
+                            log.error("Failed to restore database auto-commit after saving inventory!", exception);
+                        }
+                        try {
+                            connection.close();
+                        } catch (SQLException exception) {
+                            log.error("Failed to close database connection after saving inventory!", exception);
+                        }
+                    }
+                }
+
+                if (!saved) return;
+                if (AxInventoryRestore.isDebugMode()) LogUtils.debug("Backup ready for {} in {}ms", player.getName(), System.currentTimeMillis() - time);
+
+                BackupLimiter.tryLimit(player.getUniqueId(), reason.toLowerCase(Locale.ENGLISH).replace("_", "-"), reason);
+            } finally {
+                this.mutationLock.unlock();
+            }
         });
     }
 
     @Override
     public int storeItems(byte[] items) {
-        final String sql = "INSERT INTO axir_storage(inventory) VALUES (?);";
-        try (Connection conn = getConnection(); PreparedStatement stmt = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
-            stmt.setBytes(1, items);
-            stmt.executeUpdate();
-
-            try (ResultSet rs = stmt.getGeneratedKeys()) {
-                if (rs.next()) {
-                    return rs.getInt(1);
-                }
-            }
+        try (Connection connection = getConnection()) {
+            return storeItems(connection, items);
         } catch (SQLException exception) {
             log.error("An unexpected error occurred while storing items!", exception);
         }
 
         throw new RuntimeException("Failed to save inventory!");
+    }
+
+    private int storeItems(Connection connection, byte[] items) throws SQLException {
+        final String sql = "INSERT INTO axir_storage(inventory) VALUES (?);";
+        try (PreparedStatement statement = connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
+            statement.setBytes(1, items);
+            statement.executeUpdate();
+
+            try (ResultSet resultSet = statement.getGeneratedKeys()) {
+                if (resultSet.next()) {
+                    return resultSet.getInt(1);
+                }
+            }
+        }
+
+        throw new SQLException("Failed to get the generated inventory storage id");
     }
 
     @Override
@@ -571,16 +620,24 @@ public abstract class Base implements Database {
 
     @Override
     public int addRestoreRequest(int backupId) {
-        final String sql = "INSERT INTO axir_restorerequests(backupId, granted) VALUES (?, false);";
-        try (Connection conn = getConnection(); PreparedStatement stmt = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
-            stmt.setInt(1, backupId);
-            stmt.executeUpdate();
+        this.mutationLock.lock();
+        try {
+            final String sql = "INSERT INTO axir_restorerequests(backupId, granted) SELECT ?, false WHERE EXISTS (SELECT 1 FROM axir_backups WHERE id = ?);";
+            try (Connection conn = getConnection(); PreparedStatement stmt = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
+                stmt.setInt(1, backupId);
+                stmt.setInt(2, backupId);
+                if (stmt.executeUpdate() == 0) {
+                    return -1;
+                }
 
-            try (ResultSet rs = stmt.getGeneratedKeys()) {
-                if (rs.next()) return rs.getInt(1);
+                try (ResultSet rs = stmt.getGeneratedKeys()) {
+                    if (rs.next()) return rs.getInt(1);
+                }
+            } catch (SQLException exception) {
+                log.error("An unexpected error occurred while adding restore request!", exception);
             }
-        } catch (SQLException exception) {
-            log.error("An unexpected error occurred while adding restore request!", exception);
+        } finally {
+            this.mutationLock.unlock();
         }
 
         return -1;
@@ -695,35 +752,57 @@ public abstract class Base implements Database {
 
     @Override
     public void removeLastSaves(UUID uuid, @Nullable String reason, int amount) {
-        final String noReason = "SELECT id FROM axir_backups WHERE userId = ? ORDER BY time ASC LIMIT ?;";
-        final String withReason = "SELECT id FROM axir_backups WHERE userId = ? AND reasonId = ? ORDER BY time ASC LIMIT ?;";
-        try (Connection connection = getConnection(); PreparedStatement stmt = connection.prepareStatement(reason == null ? noReason : withReason)) {
-            stmt.setInt(1, getUserId(uuid));
-            if (reason == null) {
-                stmt.setInt(2, amount);
-            } else {
-                stmt.setInt(2, getReasonId(reason));
-                stmt.setInt(3, amount);
-            }
+        this.mutationLock.lock();
+        try {
+            final String noReason = "SELECT id FROM axir_backups WHERE userId = ? ORDER BY time ASC LIMIT ?;";
+            final String withReason = "SELECT id FROM axir_backups WHERE userId = ? AND reasonId = ? ORDER BY time ASC LIMIT ?;";
+            try (Connection connection = getConnection()) {
+                boolean originalAutoCommit = connection.getAutoCommit();
+                try {
+                    connection.setAutoCommit(false);
+                    List<String> ids = new ArrayList<>();
+                    try (PreparedStatement stmt = connection.prepareStatement(reason == null ? noReason : withReason)) {
+                        stmt.setInt(1, getUserId(uuid));
+                        if (reason == null) {
+                            stmt.setInt(2, amount);
+                        } else {
+                            stmt.setInt(2, getReasonId(reason));
+                            stmt.setInt(3, amount);
+                        }
 
-            List<String> ids = new ArrayList<>();
-            try (ResultSet rs = stmt.executeQuery()) {
-                while (rs.next()) {
-                    ids.add("" + rs.getInt(1));
+                        try (ResultSet rs = stmt.executeQuery()) {
+                            while (rs.next()) {
+                                ids.add("" + rs.getInt(1));
+                            }
+                        }
+                    }
+
+                    if (ids.isEmpty()) return;
+                    // there is no way to inject anything in here, so we can insert the values right into the update sql
+                    final String deleteRequests = "DELETE FROM axir_restorerequests WHERE backupId IN (" + String.join(",", ids) + ");";
+                    try (PreparedStatement stmt = connection.prepareStatement(deleteRequests)) {
+                        stmt.executeUpdate();
+                    }
+
+                    final String delete = "DELETE FROM axir_backups WHERE id IN (" + String.join(",", ids) + ");";
+                    try (PreparedStatement stmt = connection.prepareStatement(delete)) {
+                        stmt.executeUpdate();
+                    }
+                    connection.commit();
+                } catch (SQLException exception) {
+                    connection.rollback();
+                    throw exception;
+                } finally {
+                    connection.setAutoCommit(originalAutoCommit);
                 }
+            } catch (SQLException exception) {
+                log.error("An unexpected error occurred while removing last save for {}!", uuid, exception);
             }
 
-            if (ids.isEmpty()) return;
-            // there is no way to inject anything in here, so we can insert the values right into the update sql
-            final String delete = "DELETE FROM axir_backups WHERE id IN (" + String.join(",", ids) + ");";
-            try (PreparedStatement stmt2 = connection.prepareStatement(delete)) {
-                stmt2.executeUpdate();
-            }
-        } catch (SQLException exception) {
-            log.error("An unexpected error occurred while removing last save for {}!", uuid, exception);
+            this.clean();
+        } finally {
+            this.mutationLock.unlock();
         }
-
-        this.clean();
     }
 
     private void clean() {
@@ -784,27 +863,72 @@ public abstract class Base implements Database {
     }
 
     @Override
-    public void cleanup() {
-        final String sql = "DELETE FROM axir_backups WHERE time < ?;";
-        try (Connection conn = getConnection(); PreparedStatement stmt = conn.prepareStatement(sql)) {
-            stmt.setLong(1, System.currentTimeMillis() - (86_400_000L * AxInventoryRestore.CONFIG.getLong("cleanup-after-days")));
-            stmt.executeUpdate();
-        } catch (SQLException exception) {
-            log.error("An unexpected error occurred while cleaning up!", exception);
-        }
+    public boolean cleanup() {
+        this.mutationLock.lock();
+        Connection connection = null;
+        boolean originalAutoCommit = true;
+        try {
+            connection = getConnection();
+            if (connection == null) {
+                log.error("Failed to clean up database because no connection was available!");
+                return false;
+            }
 
-        final String sql2 = "DELETE FROM axir_storage WHERE NOT EXISTS (SELECT 1 FROM axir_backups WHERE axir_backups.inventoryId = axir_storage.id);";
-        try (Connection conn = getConnection(); PreparedStatement stmt = conn.prepareStatement(sql2)) {
-            stmt.executeUpdate();
-        } catch (SQLException exception) {
-            log.error("An unexpected error occurred while cleaning up!", exception);
-        }
+            originalAutoCommit = connection.getAutoCommit();
+            connection.setAutoCommit(false);
 
-        final String sql3 = "DELETE FROM axir_worlds WHERE NOT EXISTS (SELECT 1 FROM axir_backups WHERE axir_backups.worldId = axir_worlds.id);";
-        try (Connection conn = getConnection(); PreparedStatement stmt = conn.prepareStatement(sql3)) {
-            stmt.executeUpdate();
-        } catch (SQLException exception) {
-            log.error("An unexpected error occurred while cleaning up!", exception);
+            long cutoff = System.currentTimeMillis() - (86_400_000L * AxInventoryRestore.CONFIG.getLong("cleanup-after-days"));
+
+            // Restore requests cannot outlive the backup that they reference.
+            final String deleteExpiredRestoreRequests = "DELETE FROM axir_restorerequests WHERE backupId IN (SELECT id FROM axir_backups WHERE time < ?);";
+            try (PreparedStatement statement = connection.prepareStatement(deleteExpiredRestoreRequests)) {
+                statement.setLong(1, cutoff);
+                statement.executeUpdate();
+            }
+
+            final String deleteBackups = "DELETE FROM axir_backups WHERE time < ?;";
+            try (PreparedStatement statement = connection.prepareStatement(deleteBackups)) {
+                statement.setLong(1, cutoff);
+                statement.executeUpdate();
+            }
+
+            // Remove requests left orphaned by older plugin versions or manual database edits.
+            final String deleteRestoreRequests = "DELETE FROM axir_restorerequests WHERE NOT EXISTS (SELECT 1 FROM axir_backups WHERE axir_backups.id = axir_restorerequests.backupId);";
+            try (PreparedStatement statement = connection.prepareStatement(deleteRestoreRequests)) {
+                statement.executeUpdate();
+            }
+
+            final String deleteStorage = "DELETE FROM axir_storage WHERE NOT EXISTS (SELECT 1 FROM axir_backups WHERE axir_backups.inventoryId = axir_storage.id);";
+            try (PreparedStatement statement = connection.prepareStatement(deleteStorage)) {
+                statement.executeUpdate();
+            }
+
+            connection.commit();
+            return true;
+        } catch (Exception exception) {
+            if (connection != null) {
+                try {
+                    connection.rollback();
+                } catch (SQLException rollbackException) {
+                    exception.addSuppressed(rollbackException);
+                }
+            }
+            log.error("An unexpected error occurred while cleaning up! All cleanup changes were rolled back.", exception);
+            return false;
+        } finally {
+            if (connection != null) {
+                try {
+                    connection.setAutoCommit(originalAutoCommit);
+                } catch (SQLException exception) {
+                    log.error("Failed to restore database auto-commit after cleanup!", exception);
+                }
+                try {
+                    connection.close();
+                } catch (SQLException exception) {
+                    log.error("Failed to close database connection after cleanup!", exception);
+                }
+            }
+            this.mutationLock.unlock();
         }
     }
 

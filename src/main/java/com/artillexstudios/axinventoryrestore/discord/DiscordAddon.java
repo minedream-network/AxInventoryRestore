@@ -57,6 +57,9 @@ public class DiscordAddon extends ListenerAdapter {
         }
 
         int id = AxInventoryRestore.getDatabase().addRestoreRequest(backupData.getId());
+        if (id == -1) {
+            return CompletableFuture.completedFuture(false);
+        }
 
         Map<String, String> replacements = new HashMap<>();
         replacements.put("%player%", backupData.getPlayerName());

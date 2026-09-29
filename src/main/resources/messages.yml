@@ -4,6 +4,7 @@ reloaded: "&#33FF33Successfully reloaded plugin!"
 reload-fail: "&#FF3333Failed to reload the plugin! Something is wrong in the &f%file%&#FF3333 file, look in the console or use a yaml validator to fix the errors!"
 
 cleaned-up: "&#33FF33Successfully cleaned up database!"
+cleanup-failed: "&#FF3333Failed to clean up the database! Check the console for errors."
 
 manual-backup: "&#33FF33Successfully made a manual backup for &f%player%&#33FF33!"
 manual-backup-all: "&#33FF33Successfully made a manual backup for all players!"
@@ -194,4 +195,4 @@ commands:
 update-notifier: "&#88CCFFThere is a new version of AxInventoryRestore available! &#DDDDDD(&#FFFFFFcurrent: &#FF0000%current% &#DDDDDD| &#FFFFFFlatest: &#00FF00%latest%&#DDDDDD)"
 
 # do not change this
-version: 9
+version: 10

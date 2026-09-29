@@ -65,7 +65,7 @@ public interface Database {
 
     void removeRestoreRequest(int restoreId);
 
-    void cleanup();
+    boolean cleanup();
 
     void disable();
 }
